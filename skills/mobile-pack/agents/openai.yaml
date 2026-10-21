@@ -1,0 +1,4 @@
+interface:
+  display_name: "移动端打包"
+  short_description: "按项目配置通过 HBuilderX 构建并下载 Android 或 iOS 安装包"
+  default_prompt: "使用 $mobile-pack 打包移动端；先确认 Android 或 iOS，再读取项目配置。"

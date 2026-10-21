@@ -1,0 +1,175 @@
+{
+  "project": {
+    "name": "example-project"
+  },
+  "jenkins": {
+    "defaultProfile": "production",
+    "profiles": {
+      "production": {
+        "urlEnv": "JENKINS_URL",
+        "usernameEnv": "JENKINS_USER_ID",
+        "tokenEnv": "JENKINS_API_TOKEN",
+        "remote": "origin",
+        "branch": "main",
+        "folder": "release",
+        "useProxy": false,
+        "parameters": {
+          "action": "ACTION",
+          "ref": "REF",
+          "deploy": "DEPLOY",
+          "buildOnly": "BUILD_ONLY",
+          "rollback": "ROLLBACK",
+          "rollbackRelease": "ROLLBACK_RELEASE"
+        },
+        "artifactPath": "artifact/artifacts/BUILD_INFO",
+        "deploymentOrder": [
+          "backend",
+          "web"
+        ],
+        "components": {
+          "backend": {
+            "job": "backend-release",
+            "changePaths": [
+              "backend/",
+              "shared/"
+            ],
+            "migrationPaths": [
+              "backend/db/migrations/"
+            ],
+            "migrationRecord": "docs/deployments.md",
+            "health": {
+              "urlEnv": "BACKEND_HEALTH_URL",
+              "timeoutSec": 180,
+              "expectStatus": 200,
+              "expectJson": {
+                "status": "UP"
+              }
+            },
+            "releaseIdPattern": "release-backend-[0-9]+-[A-Za-z0-9._-]+"
+          },
+          "web": {
+            "job": "web-release",
+            "changePaths": [
+              "frontend/",
+              "shared/"
+            ],
+            "health": {
+              "urlEnv": "WEB_HEALTH_URL",
+              "timeoutSec": 120,
+              "expectStatus": 200
+            },
+            "releaseIdPattern": "release-web-[0-9]+-[A-Za-z0-9._-]+"
+          }
+        }
+      },
+      "test": {
+        "urlEnv": "JENKINS_TEST_URL",
+        "usernameEnv": "JENKINS_TEST_USER_ID",
+        "tokenEnv": "JENKINS_TEST_API_TOKEN",
+        "remote": "origin",
+        "branch": "develop",
+        "folder": "test",
+        "useProxy": false,
+        "parameters": {
+          "action": "ACTION",
+          "ref": "REF",
+          "deploy": "DEPLOY",
+          "buildOnly": "BUILD_ONLY",
+          "rollback": "ROLLBACK",
+          "rollbackRelease": "ROLLBACK_RELEASE"
+        },
+        "artifactPath": "artifact/artifacts/BUILD_INFO",
+        "deploymentOrder": [
+          "backend",
+          "web"
+        ],
+        "components": {
+          "backend": {
+            "job": "backend-test",
+            "changePaths": [
+              "backend/",
+              "shared/"
+            ]
+          },
+          "web": {
+            "job": "web-test",
+            "changePaths": [
+              "frontend/",
+              "shared/"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "mobilePack": {
+    "project": ".",
+    "manifest": "src/manifest.json",
+    "outputDir": "unpackage/release",
+    "namePrefix": "example-app",
+    "cliEnv": "HBUILDERX_CLI",
+    "timeoutSec": 2700,
+    "requireNodeModules": true,
+    "android": {
+      "packageName": "com.example.app",
+      "certAlias": "release",
+      "certFile": "signing/release.keystore",
+      "certPasswordEnv": "MOBILE_ANDROID_KEY_PASSWORD",
+      "storePasswordEnv": "MOBILE_ANDROID_STORE_PASSWORD"
+    },
+    "ios": {
+      "bundleId": "com.example.app",
+      "certFile": "signing/release.p12",
+      "profile": "signing/release.mobileprovision",
+      "certPasswordEnv": "MOBILE_IOS_CERT_PASSWORD",
+      "supportedDevices": "iPhone"
+    }
+  },
+  "pingcode": {
+    "baseUrl": "https://open.pingcode.com",
+    "defaultProject": "PROJ",
+    "me": "",
+    "evidenceDir": "~/.pingcode-mcp/evidence"
+  },
+  "shot": {
+    "browserChannel": "msedge",
+    "targets": {
+      "app": {
+        "baseUrl": "http://localhost:5173/",
+        "routePrefix": "#/",
+        "mobile": true,
+        "viewport": [
+          440,
+          956
+        ],
+        "login": {
+          "path": "login",
+          "userSelector": "input[type=text]",
+          "passwordSelector": "input[type=password]",
+          "submitSelector": "button[type=submit]",
+          "userEnv": "LOCAL_APP_USER",
+          "passwordEnv": "LOCAL_APP_PASSWORD",
+          "successUrlExcludes": "login"
+        }
+      },
+      "admin": {
+        "baseUrl": "http://localhost:5174/",
+        "routePrefix": "",
+        "mobile": false,
+        "viewport": [
+          1536,
+          864
+        ],
+        "login": {
+          "path": "login",
+          "userSelector": "input[type=text]",
+          "passwordSelector": "input[type=password]",
+          "submitSelector": "button[type=submit]",
+          "userEnv": "LOCAL_ADMIN_USER",
+          "passwordEnv": "LOCAL_ADMIN_PASSWORD",
+          "successUrlExcludes": "login"
+        }
+      }
+    }
+  }
+}

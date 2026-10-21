@@ -1,0 +1,26 @@
+# Local credentials and project configuration
+.agent-skills.json
+.agent-skills.env
+.agent-skills.local.json
+*.local.json
+*.local.env
+
+# Mobile signing material and build output
+*.keystore
+*.jks
+*.p12
+*.pfx
+*.cer
+*.key
+*.mobileprovision
+unpackage/
+dist/
+build/
+
+# Runtime caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+node_modules/
+*.log

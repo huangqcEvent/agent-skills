@@ -1,0 +1,1485 @@
+diff --git a/scripts/integration-test.ts b/scripts/integration-test.ts
+index cd01676..affaf77 100644
+--- a/scripts/integration-test.ts
++++ b/scripts/integration-test.ts
+@@ -1,6 +1,7 @@
+ #!/usr/bin/env node
+ 
+ import { pingCodeClient } from '../src/client/index.js';
++import { tokenManager } from '../src/auth/index.js';
+ 
+ interface TestCase {
+   name: string;
+@@ -29,6 +30,12 @@ async function main() {
+   console.log('\n=== PingCode MCP 集成测试 ===\n');
+   console.log('⚠️  请确保已运行配置流程: npx tsx src/cli.ts configure\n');
+ 
++  const initialized = await tokenManager.initialize();
++  if (!initialized) {
++    console.error('未找到认证配置，请先运行: npx tsx src/cli.ts configure');
++    process.exit(1);
++  }
++
+   const testStart = Date.now();
+   let passed = 0;
+   let failed = 0;
+@@ -52,11 +59,11 @@ async function main() {
+     },
+     {
+       name: '获取产品列表',
+-      fn: () => pingCodeClient.get('/v1/products?page_index=0&page_size=5'),
++      fn: () => pingCodeClient.get('/v1/ship/products?page_index=0&page_size=5'),
+     },
+     {
+       name: '获取工时类型列表',
+-      fn: () => pingCodeClient.get('/v1/workload/types'),
++      fn: () => pingCodeClient.get('/v1/workload_types'),
+     },
+     {
+       name: '获取 Wiki 空间列表',
+diff --git a/src/auth/config.ts b/src/auth/config.ts
+index 184c768..c4601b1 100644
+--- a/src/auth/config.ts
++++ b/src/auth/config.ts
+@@ -31,7 +31,7 @@ export function loadAuthState(): AuthState | null {
+     return {
+       config,
+       enterprise: persisted.enterprise
+-        ? { clientId: persisted.enterprise.clientId, clientSecret: '' }
++        ? { clientId: persisted.enterprise.clientId, clientSecret: persisted.enterprise.clientSecret ?? '' }
+         : undefined,
+       personal: persisted.personal
+         ? { clientId: persisted.personal.clientId, clientSecret: '', signinName: persisted.personal.signinName, password: '' }
+@@ -53,7 +53,7 @@ export function saveAuthState(state: AuthState): void {
+       subdomain: state.config.subdomain,
+     },
+     enterprise: state.enterprise
+-      ? { clientId: state.enterprise.clientId }
++      ? { clientId: state.enterprise.clientId, clientSecret: state.enterprise.clientSecret || undefined }
+       : undefined,
+     personal: state.personal
+       ? { clientId: state.personal.clientId, clientSecret: state.personal.clientSecret, signinName: state.personal.signinName }
+diff --git a/src/auth/token-manager.ts b/src/auth/token-manager.ts
+index 39b1489..289523b 100644
+--- a/src/auth/token-manager.ts
++++ b/src/auth/token-manager.ts
+@@ -1,6 +1,7 @@
+ import { createAxiosInstance } from '../utils/http.js';
+ import type { TokenPair, AuthState } from './types.js';
+ import { loadAuthState, saveAuthState, isTokenValid, clearAuthState } from './config.js';
++import { getEnterpriseToken } from './enterprise-auth.js';
+ 
+ export class TokenManager {
+   private state: AuthState | null = null;
+@@ -31,7 +32,29 @@ export class TokenManager {
+     return isTokenValid(this.state.tokens);
+   }
+ 
++  /** 企业令牌没有 refresh_token，过期后用保存的 client 凭据重新换取 */
++  private async renewEnterpriseToken(): Promise<boolean> {
++    if (!this.state || this.state.config.tokenType !== 'enterprise') return false;
++    const clientId = process.env.PINGCODE_CLIENT_ID || this.state.enterprise?.clientId;
++    const clientSecret = process.env.PINGCODE_CLIENT_SECRET || this.state.enterprise?.clientSecret;
++    if (!clientId || !clientSecret) return false;
++    try {
++      this.state.tokens = await getEnterpriseToken(
++        this.state.config.baseUrl,
++        { clientId, clientSecret },
++        this.state.config.isPrivate,
++      );
++      saveAuthState(this.state);
++      return true;
++    } catch {
++      return false;
++    }
++  }
++
+   async refreshToken(): Promise<boolean> {
++    if (await this.renewEnterpriseToken()) {
++      return true;
++    }
+     if (!this.state || !this.state.tokens?.refreshToken) {
+       return false;
+     }
+diff --git a/src/auth/types.ts b/src/auth/types.ts
+index b24376b..99d4028 100644
+--- a/src/auth/types.ts
++++ b/src/auth/types.ts
+@@ -44,6 +44,8 @@ export interface PersistedAuthState {
+   config: AuthConfig;
+   enterprise?: {
+     clientId: string;
++    /** 保存后企业令牌过期可自动续期 */
++    clientSecret?: string;
+   };
+   personal?: {
+     clientId: string;
+diff --git a/src/index.ts b/src/index.ts
+index 9ddc5dc..5676708 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -62,10 +62,12 @@ import {
+   generateTeamLoadReport,
+   scanDeliveryRisks,
+ } from './tools/insights.js';
++import { BUGFIX_TOOLS, handleBugfixTool } from './tools/bugfix.js';
+ import { logWarn, logInfo, logError } from './utils/logger.js';
+ import { validateArgs, type JsonSchema } from './utils/validation.js';
+ 
+ const TOOLS: Tool[] = [
++  ...BUGFIX_TOOLS,
+   {
+     name: 'pingcode__configure_auth',
+     description: '重新配置 PingCode 认证信息（部署地址、令牌类型、凭据）',
+@@ -220,7 +222,7 @@ const TOOLS: Tool[] = [
+   },
+   {
+     name: 'pingcode__get_work_item',
+-    description: '获取指定工作项的详细信息',
++    description: '按内部 ID 获取工作项原始 JSON（描述是 HTML，截图看不到）。看 bug / 需求详情请用 pingcode__view_work_item',
+     inputSchema: {
+       type: 'object',
+       properties: {
+@@ -297,6 +299,7 @@ const TOOLS: Tool[] = [
+       type: 'object',
+       properties: {
+         sprint_id: { type: 'string', description: '迭代ID' },
++        project_id: { type: 'string', description: '项目ID；迭代属于项目，查询详情时建议提供' },
+       },
+       required: ['sprint_id'],
+     },
+@@ -768,6 +771,9 @@ async function handleToolCall(request: CallToolRequest) {
+         };
+       }
+     }
++    const bugfixResult = await handleBugfixTool(name, args as Record<string, unknown> | undefined);
++    if (bugfixResult) return bugfixResult;
++
+     switch (name) {
+       case 'pingcode__configure_auth': {
+         await runAuthSetup();
+@@ -1052,7 +1058,7 @@ async function handleToolCall(request: CallToolRequest) {
+       }
+ 
+       case 'pingcode__get_sprint': {
+-        const data = await getSprint(String(args?.sprint_id));
++        const data = await getSprint(String(args?.sprint_id), args?.project_id as string | undefined);
+         return {
+           content: [
+             {
+@@ -1070,7 +1076,7 @@ async function handleToolCall(request: CallToolRequest) {
+         params.append('page_size', String(args?.page_size ?? 30));
+ 
+         const query = params.toString() ? `?${params.toString()}` : '';
+-        const data = await pingCodeClient.get(`/v1/products${query}`);
++        const data = await pingCodeClient.get(`/v1/ship/products${query}`);
+         return {
+           content: [
+             {
+@@ -1089,7 +1095,7 @@ async function handleToolCall(request: CallToolRequest) {
+         params.append('page_size', String(args?.page_size ?? 30));
+ 
+         const query = params.toString() ? `?${params.toString()}` : '';
+-        const data = await pingCodeClient.get(`/v1/requirements${query}`);
++        const data = await pingCodeClient.get(`/v1/ship/ideas${query}`);
+         return {
+           content: [
+             {
+diff --git a/src/tools/bugfix.ts b/src/tools/bugfix.ts
+new file mode 100644
+index 0000000..86afa64
+--- /dev/null
++++ b/src/tools/bugfix.ts
+@@ -0,0 +1,1074 @@
++/**
++ * 研发改 bug 的闭环工具：列出我的工作项 → 看详情（含原图）→ 改状态 / 回写评论。
++ *
++ * 与上游工具的区别：
++ * - 支持用编号（PROJ-21）或网页链接定位工作项，不必先查内部 ID；
++ * - 描述、多行文本属性、评论里的截图带 public_image_token 下载原图，
++ *   以 MCP image 内容块返回（模型直接看到原图），同时落盘到 ~/.pingcode-mcp/cache 便于复查；
++ * - 下拉 / 成员 / 日期属性翻译成可读文本；
++ * - 企业令牌没有个人身份，「我」取自 ~/.pingcode-mcp/settings.json 的 me，评论用 created_by 署名。
++ */
++import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'fs';
++import { basename, extname, join } from 'path';
++import { homedir } from 'os';
++import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
++import { pingCodeClient } from '../client/index.js';
++import { tokenManager } from '../auth/index.js';
++import { createAxiosInstance } from '../utils/http.js';
++import { htmlToMarkdown, type HtmlImage } from '../utils/html-to-markdown.js';
++import { logWarn } from '../utils/logger.js';
++
++// ---------------------------------------------------------------------------
++// 配置
++
++const DATA_DIR = join(homedir(), '.pingcode-mcp');
++const SETTINGS_FILE = join(DATA_DIR, 'settings.json');
++const CACHE_DIR = join(DATA_DIR, 'cache');
++
++/** Claude 单图上限 5MB（base64 后），原图超过此值只落盘不内联 */
++const MAX_INLINE_IMAGE_BYTES = 3_750_000;
++const MAX_INLINE_TOTAL_BYTES = 15_000_000;
++const MAX_FILE_DOWNLOAD_BYTES = 20_000_000;
++
++interface Settings {
++  /** 我的 PingCode 姓名 / 用户名 / 邮箱 / 用户 ID */
++  me?: string;
++  /** 默认项目编号，如 PROJ */
++  default_project?: string;
++}
++
++function loadSettings(): Settings {
++  let settings: Settings = {};
++  try {
++    if (existsSync(SETTINGS_FILE)) {
++      settings = JSON.parse(readFileSync(SETTINGS_FILE, 'utf-8').replace(/^﻿/, '')) as Settings;
++    }
++  } catch (error) {
++    logWarn('settings.json 解析失败，忽略', { error: String(error) });
++  }
++  return {
++    me: process.env.PINGCODE_ME || settings.me,
++    default_project: process.env.PINGCODE_DEFAULT_PROJECT || settings.default_project,
++  };
++}
++
++// ---------------------------------------------------------------------------
++// 类型
++
++interface Ref {
++  id: string;
++  name?: string;
++  display_name?: string;
++}
++
++interface WorkItem {
++  id: string;
++  identifier: string;
++  title: string;
++  type: string;
++  short_id: string;
++  html_url: string;
++  project: { id: string; identifier: string; name: string };
++  state: { id: string; name: string; type: string } | null;
++  priority: { id: string; name: string } | null;
++  assignee: Ref | null;
++  created_by: Ref | null;
++  created_at: number;
++  updated_at: number;
++  start_at: number | null;
++  end_at: number | null;
++  sprint: { name?: string } | null;
++  versions: { name?: string }[] | null;
++  tags: { name: string }[] | null;
++  description: string | null;
++  properties: Record<string, unknown> | null;
++  public_image_token?: string;
++}
++
++interface Page<T> {
++  total: number;
++  page_index: number;
++  page_size: number;
++  values: T[];
++}
++
++interface PropertyDef {
++  id: string;
++  name: string;
++  type: string;
++  options: { _id: string; text: string }[] | null;
++}
++
++interface StateDef {
++  id: string;
++  name: string;
++  type: string;
++}
++
++interface CommentItem {
++  id: string;
++  content: string;
++  attachment_count: number;
++  attachments: unknown[];
++  created_at: number;
++  created_by: Ref | null;
++  is_deleted: number;
++  replied_comment: { content?: string } | null;
++}
++
++interface Attachment {
++  id: string;
++  title: string;
++  size: number;
++  type: string;
++  file_type?: string;
++  ext?: string;
++  download_url?: string;
++  content?: string;
++  format?: string;
++  created_by?: Ref | null;
++}
++
++type ContentBlock = CallToolResult['content'][number];
++
++export type BugfixToolResult = CallToolResult;
++
++// ---------------------------------------------------------------------------
++// 通用查询
++
++const TYPE_NAMES: Record<string, string> = {
++  bug: '缺陷',
++  story: '用户故事',
++  task: '任务',
++  epic: '史诗',
++  feature: '特性',
++  issue: '事务',
++};
++
++const BUILTIN_PROPERTY_IDS = new Set(['assignee', 'state_id', 'start', 'due', 'priority', 'story_points', 'tags', 'description']);
++
++const propertyCache = new Map<string, PropertyDef[]>();
++const userCache = new Map<string, string>();
++let projectCache: { id: string; identifier: string; name: string }[] | null = null;
++
++async function getAllPages<T>(path: string, maxPages = 10): Promise<T[]> {
++  const sep = path.includes('?') ? '&' : '?';
++  const values: T[] = [];
++  for (let page = 0; page < maxPages; page++) {
++    const data = await pingCodeClient.get<Page<T>>(`${path}${sep}page_size=100&page_index=${page}`);
++    values.push(...(data.values ?? []));
++    if (values.length >= (data.total ?? 0) || (data.values ?? []).length === 0) break;
++  }
++  return values;
++}
++
++async function getPropertyDefs(projectId: string, typeId: string): Promise<PropertyDef[]> {
++  const key = `${projectId}:${typeId}`;
++  const cached = propertyCache.get(key);
++  if (cached) return cached;
++  try {
++    const defs = await getAllPages<PropertyDef>(
++      `/v1/pjm/work_item/properties?project_id=${projectId}&work_item_type_id=${encodeURIComponent(typeId)}`,
++      3,
++    );
++    propertyCache.set(key, defs);
++    return defs;
++  } catch (error) {
++    logWarn('读取工作项属性定义失败', { projectId, typeId, error: String(error) });
++    return [];
++  }
++}
++
++async function getStates(projectId: string, typeId: string): Promise<StateDef[]> {
++  return getAllPages<StateDef>(
++    `/v1/pjm/work_item/states?project_id=${projectId}&work_item_type_id=${encodeURIComponent(typeId)}`,
++    3,
++  );
++}
++
++async function getUserName(userId: string): Promise<string> {
++  const cached = userCache.get(userId);
++  if (cached) return cached;
++  try {
++    const user = await pingCodeClient.get<Ref>(`/v1/directory/users/${userId}`);
++    const name = user.display_name || user.name || userId;
++    userCache.set(userId, name);
++    return name;
++  } catch {
++    return userId;
++  }
++}
++
++/** 姓名 / 用户名 / 邮箱 / 用户 ID → { id, name } */
++async function resolveUser(input: string): Promise<{ id: string; name: string }> {
++  const value = input.trim();
++  if (/^[0-9a-f]{32}$/i.test(value)) {
++    return { id: value, name: await getUserName(value) };
++  }
++  const data = await pingCodeClient.get<Page<Ref & { email?: string }>>(
++    `/v1/directory/users?keywords=${encodeURIComponent(value)}&page_size=50`,
++  );
++  const users = data.values ?? [];
++  const lower = value.toLowerCase();
++  const exact = users.filter(
++    (u) => u.display_name === value || u.name?.toLowerCase() === lower || u.email?.toLowerCase() === lower,
++  );
++  const pick = exact.length === 1 ? exact[0] : users.length === 1 ? users[0] : undefined;
++  if (!pick) {
++    const candidates = users.map((u) => `${u.display_name}(${u.name})`).join('、') || '无';
++    throw new Error(`无法唯一确定用户「${value}」，候选：${candidates}`);
++  }
++  const name = pick.display_name || pick.name || pick.id;
++  userCache.set(pick.id, name);
++  return { id: pick.id, name };
++}
++
++/** 项目编号（PROJ）/ 名称 / ID → 项目 */
++async function resolveProject(input: string): Promise<{ id: string; identifier: string; name: string }> {
++  const value = input.trim();
++  if (!projectCache) {
++    projectCache = await getAllPages<{ id: string; identifier: string; name: string }>('/v1/project/projects', 5);
++  }
++  const lower = value.toLowerCase();
++  const found =
++    projectCache.find((p) => p.id === value || p.identifier.toLowerCase() === lower) ??
++    projectCache.find((p) => p.name === value);
++  if (!found) {
++    throw new Error(`找不到项目「${value}」，可用项目编号：${projectCache.map((p) => p.identifier).join('、')}`);
++  }
++  return found;
++}
++
++/** 编号（PROJ-21）/ 网页链接 / short_id / 内部 ID → 内部 ID */
++async function resolveWorkItemId(input: string): Promise<string> {
++  const value = input.trim();
++  const urlMatch = value.match(/\/workitems\/([A-Za-z0-9_-]+)/);
++  if (urlMatch) return urlMatch[1];
++  if (/^[A-Za-z][A-Za-z0-9_]*-\d+$/.test(value)) {
++    const data = await pingCodeClient.get<Page<WorkItem>>(
++      `/v1/pjm/work_items?identifier=${encodeURIComponent(value.toUpperCase())}`,
++    );
++    const item = data.values?.[0];
++    if (!item) throw new Error(`找不到工作项 ${value}`);
++    return item.id;
++  }
++  return value;
++}
++
++async function getWorkItem(id: string, imageFields: string[] = []): Promise<WorkItem> {
++  const query = imageFields.length ? `?include_public_image_token=${imageFields.slice(0, 32).join(',')}` : '';
++  return pingCodeClient.get<WorkItem>(`/v1/pjm/work_items/${id}${query}`);
++}
++
++// ---------------------------------------------------------------------------
++// 格式化
++
++function formatTime(ts: number | null | undefined, withTime = true): string {
++  if (!ts) return '';
++  const parts = new Intl.DateTimeFormat('zh-CN', {
++    timeZone: 'Asia/Shanghai',
++    year: 'numeric',
++    month: '2-digit',
++    day: '2-digit',
++    hour: '2-digit',
++    minute: '2-digit',
++    hour12: false,
++  }).formatToParts(new Date(ts * 1000));
++  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? '';
++  const date = `${get('year')}-${get('month')}-${get('day')}`;
++  return withTime ? `${date} ${get('hour')}:${get('minute')}` : date;
++}
++
++function formatBytes(bytes: number | undefined): string {
++  if (!bytes) return '';
++  if (bytes < 1024) return `${bytes} B`;
++  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
++  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
++}
++
++function personName(ref: Ref | null | undefined): string {
++  return ref ? ref.display_name || ref.name || ref.id : '';
++}
++
++async function formatPropertyValue(def: PropertyDef, raw: unknown, images: HtmlImage[]): Promise<string> {
++  if (raw === null || raw === undefined || raw === '' || (Array.isArray(raw) && raw.length === 0)) return '';
++  const values = Array.isArray(raw) ? raw : [raw];
++  const parts: string[] = [];
++  for (const value of values) {
++    if (value && typeof value === 'object') {
++      const obj = value as Record<string, unknown>;
++      parts.push(String(obj.display_name ?? obj.name ?? obj.title ?? obj.text ?? obj.id ?? JSON.stringify(obj)));
++      continue;
++    }
++    if (def.options?.length) {
++      parts.push(def.options.find((o) => o._id === value)?.text ?? String(value));
++    } else if (def.type === 'member' && typeof value === 'string') {
++      parts.push(await getUserName(value));
++    } else if (def.type === 'date' && typeof value === 'number') {
++      parts.push(formatTime(value, false));
++    } else if (def.type === 'textarea' && typeof value === 'string') {
++      parts.push(htmlToMarkdown(value, images));
++    } else {
++      parts.push(String(value));
++    }
++  }
++  return parts.join('、');
++}
++
++// ---------------------------------------------------------------------------
++// 图片与附件下载
++
++function guessMime(buffer: Buffer, contentType: string | undefined): string | undefined {
++  const type = (contentType ?? '').split(';')[0].trim().toLowerCase();
++  if (type.startsWith('image/')) return type === 'image/jpg' ? 'image/jpeg' : type;
++  if (buffer.length >= 4) {
++    if (buffer[0] === 0x89 && buffer[1] === 0x50) return 'image/png';
++    if (buffer[0] === 0xff && buffer[1] === 0xd8) return 'image/jpeg';
++    if (buffer.toString('ascii', 0, 3) === 'GIF') return 'image/gif';
++    if (buffer.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
++  }
++  return undefined;
++}
++
++const EXT_BY_MIME: Record<string, string> = {
++  'image/png': 'png',
++  'image/jpeg': 'jpg',
++  'image/gif': 'gif',
++  'image/webp': 'webp',
++};
++
++async function downloadBinary(url: string, withAuth: boolean): Promise<{ buffer: Buffer; contentType?: string }> {
++  const http = createAxiosInstance();
++  const headers: Record<string, string> = {};
++  if (withAuth) {
++    const token = await tokenManager.ensureValidToken();
++    if (token) headers.Authorization = `Bearer ${token}`;
++  }
++  // 图片在腾讯云 COS 上，偶发连接超时：网络错误重试两次，HTTP 错误直接抛出
++  for (let attempt = 0; ; attempt++) {
++    try {
++      const response = await http.get<ArrayBuffer>(url, {
++        responseType: 'arraybuffer',
++        headers,
++        maxContentLength: MAX_FILE_DOWNLOAD_BYTES,
++        timeout: 30000,
++      });
++      return {
++        buffer: Buffer.from(response.data),
++        contentType: response.headers['content-type'] as string | undefined,
++      };
++    } catch (error) {
++      const hasResponse = Boolean((error as { response?: unknown }).response);
++      if (hasResponse || attempt >= 2) throw error;
++      await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
++    }
++  }
++}
++
++/** PingCode 公共图片需要拼上 public_image_token 才会 302 到原图 */
++function withImageToken(src: string, token: string | undefined): string {
++  if (!token || !/\.pingcode\.com\/files\/public\//.test(src) || /[?&]token=/.test(src)) return src;
++  return `${src}${src.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`;
++}
++
++function safeName(name: string): string {
++  return name.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 80);
++}
++
++interface FetchedImage {
++  label: string;
++  note: string;
++  path?: string;
++  block?: { type: 'image'; data: string; mimeType: string };
++}
++
++async function fetchImage(
++  label: string,
++  url: string,
++  token: string | undefined,
++  dir: string,
++  inline: boolean,
++): Promise<FetchedImage> {
++  try {
++    let result = await downloadBinary(withImageToken(url, token), false);
++    let mime = guessMime(result.buffer, result.contentType);
++    if (!mime) {
++      result = await downloadBinary(url, true);
++      mime = guessMime(result.buffer, result.contentType);
++    }
++    if (!mime) {
++      return { label, note: `下载失败（返回的不是图片：${result.contentType ?? '未知类型'}）` };
++    }
++    const path = join(dir, `${safeName(label)}.${EXT_BY_MIME[mime] ?? 'img'}`);
++    writeFileSync(path, result.buffer);
++    const size = formatBytes(result.buffer.length);
++    if (!inline) return { label, note: `${size}，已保存（未内联）`, path };
++    if (result.buffer.length > MAX_INLINE_IMAGE_BYTES) {
++      return { label, note: `${size}，超过内联上限，请打开本地文件查看`, path };
++    }
++    return {
++      label,
++      note: size,
++      path,
++      block: { type: 'image', data: result.buffer.toString('base64'), mimeType: mime },
++    };
++  } catch (error) {
++    return { label, note: `下载失败：${error instanceof Error ? error.message : String(error)}` };
++  }
++}
++
++// ---------------------------------------------------------------------------
++// 工具：查看工作项
++
++export interface ViewWorkItemParams {
++  work_item: string;
++  include_images?: boolean;
++  max_images?: number;
++  include_comments?: boolean;
++  download_files?: boolean;
++}
++
++export async function viewWorkItem(params: ViewWorkItemParams): Promise<BugfixToolResult> {
++  const includeImages = params.include_images !== false;
++  const maxImages = Math.max(0, params.max_images ?? 10);
++  const id = await resolveWorkItemId(params.work_item);
++
++  // 先取一次拿到项目与类型，再按属性定义申请所有富文本字段的图片令牌
++  let item = await getWorkItem(id, ['description']);
++  const defs = await getPropertyDefs(item.project.id, item.type);
++  const richProps = defs.filter((d) => d.type === 'textarea' && d.id !== 'description');
++  const richWithImages = richProps.filter((d) => /<img/i.test(String(item.properties?.[d.id] ?? '')));
++  if (richWithImages.length) {
++    item = await getWorkItem(item.id, ['description', ...richWithImages.map((d) => `properties.${d.id}`)]);
++  }
++
++  const images: HtmlImage[] = [];
++  const lines: string[] = [];
++  const typeName = TYPE_NAMES[item.type] ?? item.type;
++
++  lines.push(`# ${item.identifier} ${item.title}`);
++  lines.push('');
++  const severityDef = defs.find((d) => d.id === 'severity');
++  const severity = severityDef ? await formatPropertyValue(severityDef, item.properties?.severity, images) : '';
++  lines.push(
++    `- 类型：${typeName} ｜ 状态：${item.state?.name ?? '-'} ｜ 优先级：${item.priority?.name ?? '-'}` +
++      (severity ? ` ｜ 严重程度：${severity}` : ''),
++  );
++  lines.push(
++    `- 负责人：${personName(item.assignee) || '未指派'} ｜ 创建：${personName(item.created_by)} ${formatTime(item.created_at)} ｜ 更新：${formatTime(item.updated_at)}`,
++  );
++  const extra = [
++    `项目：${item.project.identifier} ${item.project.name}`,
++    item.sprint?.name ? `迭代：${item.sprint.name}` : '',
++    item.versions?.length ? `发布：${item.versions.map((v) => v.name).join('、')}` : '',
++    item.tags?.length ? `标签：${item.tags.map((t) => t.name).join('、')}` : '',
++    item.end_at ? `截止：${formatTime(item.end_at, false)}` : '',
++  ].filter(Boolean);
++  lines.push(`- ${extra.join(' ｜ ')}`);
++  lines.push(`- 链接：${item.html_url}`);
++
++  lines.push('', '## 描述', '', htmlToMarkdown(item.description, images) || '（空）');
++
++  for (const def of richProps) {
++    const value = await formatPropertyValue(def, item.properties?.[def.id], images);
++    if (value) lines.push('', `## ${def.name}`, '', value);
++  }
++
++  const otherLines: string[] = [];
++  for (const def of defs) {
++    if (BUILTIN_PROPERTY_IDS.has(def.id) || def.type === 'textarea' || def.id === 'severity') continue;
++    const value = await formatPropertyValue(def, item.properties?.[def.id], images);
++    if (value) otherLines.push(`- ${def.name}：${value}`);
++  }
++  if (otherLines.length) lines.push('', '## 其他字段', '', ...otherLines);
++
++  const dir = join(CACHE_DIR, safeName(item.identifier));
++  mkdirSync(dir, { recursive: true });
++  const fileLines: string[] = [];
++
++  /** 附件是图片就并入 images（与正文 [图N] 共用编号），否则按需下载；返回在正文里的展示文字 */
++  const describeAttachment = async (att: Attachment): Promise<string> => {
++    if (att.type === 'snippet') {
++      return `代码段「${att.title}」\n\`\`\`${att.format ?? ''}\n${att.content ?? ''}\n\`\`\``;
++    }
++    const isImage = att.file_type === 'image' || /^(png|jpe?g|gif|webp)$/i.test(att.ext ?? '');
++    if (isImage && att.download_url) {
++      const image: HtmlImage = { index: images.length + 1, src: att.download_url, alt: att.title, size: att.size };
++      images.push(image);
++      return `[图${image.index}]`;
++    }
++    let local = '';
++    if (params.download_files && att.download_url && att.size <= MAX_FILE_DOWNLOAD_BYTES) {
++      try {
++        const result = await downloadBinary(att.download_url, false).catch(() => downloadBinary(att.download_url!, true));
++        const path = join(dir, safeName(att.title));
++        writeFileSync(path, result.buffer);
++        local = ` → 已下载 ${path}`;
++      } catch (error) {
++        local = ` → 下载失败：${error instanceof Error ? error.message : String(error)}`;
++      }
++    } else if (att.download_url) {
++      fileLines.push(att.title);
++    }
++    return `${att.title}（${att.ext ?? att.type}，${formatBytes(att.size)}）${local}`;
++  };
++
++  // 工作项附件
++  const attachments = await getAllPages<Attachment>(`/v1/attachments?principal_type=workitem&principal_id=${item.id}`, 3).catch(
++    () => [] as Attachment[],
++  );
++  if (attachments.length) {
++    lines.push('', `## 附件（${attachments.length}）`, '');
++    for (const att of attachments) lines.push(`- ${await describeAttachment(att)}`);
++  }
++
++  // 评论（附件紧跟在对应评论后面）
++  if (params.include_comments !== false) {
++    const comments = (
++      await getAllPages<CommentItem>(`/v1/comments?principal_type=workitem&principal_id=${item.id}`, 5)
++    ).filter((c) => !c.is_deleted);
++    lines.push('', `## 评论（${comments.length}）`, '');
++    if (!comments.length) lines.push('（无）');
++    for (const comment of comments) {
++      const reply = comment.replied_comment?.content
++        ? `（回复：${htmlToMarkdown(comment.replied_comment.content).slice(0, 40)}）`
++        : '';
++      const body = htmlToMarkdown(comment.content, images);
++      const attachmentTexts: string[] = [];
++      for (const ref of comment.attachments ?? []) {
++        const attachmentId = typeof ref === 'string' ? ref : (ref as { id?: string })?.id;
++        if (!attachmentId) continue;
++        try {
++          const att = await pingCodeClient.get<Attachment>(
++            `/v1/attachments/${attachmentId}?principal_type=workitem&principal_id=${item.id}&comment_id=${comment.id}`,
++          );
++          attachmentTexts.push(await describeAttachment(att));
++        } catch (error) {
++          attachmentTexts.push(`附件 ${attachmentId} 读取失败`);
++          logWarn('读取评论附件失败', { attachmentId, commentId: comment.id, error: String(error) });
++        }
++      }
++      const attachText = attachmentTexts.length ? `\n  附件：${attachmentTexts.join(' ')}` : '';
++      lines.push(
++        `- ${personName(comment.created_by)} ${formatTime(comment.created_at)}${reply}：${body.replace(/\n/g, '\n  ')}${attachText}`,
++      );
++    }
++  }
++  if (fileLines.length) lines.push('', `非图片附件未下载（${fileLines.join('、')}）；需要时用 download_files=true 重新调用。`);
++
++  // 图片
++  const imageBlocks: ContentBlock[] = [];
++  if (images.length) {
++    lines.push('', `## 图片（${images.length}）`, '');
++    if (!includeImages) {
++      lines.push('未下载图片（include_images=false）。');
++    } else {
++      let inlineBytes = 0;
++      for (const img of images) {
++        const label = `图${img.index}`;
++        const inline = imageBlocks.length / 2 < maxImages && inlineBytes < MAX_INLINE_TOTAL_BYTES;
++        const fetched = await fetchImage(label, img.src, item.public_image_token, dir, inline);
++        if (fetched.block) {
++          inlineBytes += fetched.block.data.length;
++          imageBlocks.push({ type: 'text', text: `[${label}]` }, fetched.block);
++        }
++        lines.push(`- [${label}] ${fetched.note}${fetched.path ? ` · ${fetched.path}` : ''}`);
++      }
++      if (imageBlocks.length) lines.push('', '原图按顺序附在下方。');
++    }
++  }
++
++  return { content: [{ type: 'text', text: lines.join('\n') }, ...imageBlocks] };
++}
++
++// ---------------------------------------------------------------------------
++// 工具：我的工作项
++
++export interface ListMyWorkItemsParams {
++  assignee?: string;
++  project?: string;
++  type?: string;
++  include_done?: boolean;
++  keywords?: string;
++}
++
++const PRIORITY_RANK: Record<string, number> = { 最高: 0, 紧急: 0, 高: 1, 中: 2, 低: 3, 最低: 4 };
++const STATE_RANK: Record<string, number> = { in_progress: 0, pending: 1, completed: 2, closed: 3 };
++
++export async function listMyWorkItems(params: ListMyWorkItemsParams): Promise<BugfixToolResult> {
++  const settings = loadSettings();
++  const assigneeInput = params.assignee || settings.me;
++  if (!assigneeInput) {
++    throw new Error('未指定负责人：请传 assignee，或在 ~/.pingcode-mcp/settings.json 写入 {"me": "你的 PingCode 姓名"}');
++  }
++  const user = await resolveUser(assigneeInput);
++  const projectInput = params.project ?? settings.default_project;
++  const project = projectInput && projectInput !== 'all' ? await resolveProject(projectInput) : undefined;
++  const type = params.type ?? 'bug';
++
++  const query = new URLSearchParams({ assignee_ids: user.id });
++  if (project) query.append('project_ids', project.id);
++  if (type !== 'all') query.append('type_ids', type);
++  if (params.keywords) query.append('keywords', params.keywords);
++  const items = await getAllPages<WorkItem>(`/v1/pjm/work_items?${query.toString()}`, 10);
++
++  const doneTypes = new Set(['completed', 'closed']);
++  const visible = items.filter((w) => params.include_done || !doneTypes.has(w.state?.type ?? ''));
++  visible.sort((a, b) => {
++    const pa = PRIORITY_RANK[a.priority?.name ?? ''] ?? 5;
++    const pb = PRIORITY_RANK[b.priority?.name ?? ''] ?? 5;
++    if (pa !== pb) return pa - pb;
++    const sa = STATE_RANK[a.state?.type ?? ''] ?? 4;
++    const sb = STATE_RANK[b.state?.type ?? ''] ?? 4;
++    if (sa !== sb) return sa - sb;
++    return Number(a.identifier.split('-').pop()) - Number(b.identifier.split('-').pop());
++  });
++
++  const scope = `${user.name}${project ? ` · ${project.identifier}` : ' · 全部项目'} · ${type === 'all' ? '全部类型' : TYPE_NAMES[type] ?? type}`;
++  const hidden = items.length - visible.length;
++  const lines = [
++    `# 我的工作项（${scope}）`,
++    '',
++    `共 ${visible.length} 条${hidden ? `，已隐藏已完成 / 关闭 ${hidden} 条（include_done=true 可显示）` : ''}。`,
++    '',
++    '| 编号 | 状态 | 优先级 | 图 | 标题 | 更新 |',
++    '| --- | --- | --- | --- | --- | --- |',
++  ];
++  for (const w of visible) {
++    const imageCount = (w.description ?? '').match(/<img\b/gi)?.length ?? 0;
++    const title = w.title.replace(/\|/g, '｜');
++    lines.push(
++      `| ${w.identifier} | ${w.state?.name ?? ''} | ${w.priority?.name ?? ''} | ${imageCount || ''} | ${title} | ${formatTime(w.updated_at, false)} |`,
++    );
++  }
++  lines.push('', '看详情和截图：pingcode__view_work_item（传编号即可，如 PROJ-21）。');
++  return { content: [{ type: 'text', text: lines.join('\n') }] };
++}
++
++// ---------------------------------------------------------------------------
++// 写操作：评论、附件、状态流转
++//
++// 企业令牌带管理员权限，所有写工具都分两步：不带 confirm=true 时只返回预览，
++// 由模型展示给用户确认后，再用相同参数加 confirm=true 真正写入。
++
++interface Author {
++  id: string;
++  name: string;
++}
++
++async function resolveAuthor(asUser: string | undefined): Promise<Author | undefined> {
++  const input = asUser ?? loadSettings().me;
++  return input ? resolveUser(input) : undefined;
++}
++
++/** 支持 ~/ 开头的本地路径（skill 约定截图放在 ~/.pingcode-mcp/evidence/<编号>/） */
++function expandHome(path: string): string {
++  return /^~[\\/]/.test(path) ? join(homedir(), path.slice(2)) : path;
++}
++
++function checkFiles(paths: string[]): void {
++  const missing = paths.filter((p) => !existsSync(p));
++  if (missing.length) throw new Error(`找不到文件：${missing.join('、')}`);
++}
++
++/** 连接阶段失败（请求没有发到服务器），重试不会产生重复数据 */
++function isConnectFailure(error: unknown): boolean {
++  const { code, message } = error as { code?: string; message?: string };
++  return ['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'].includes(code ?? '') || /^connect /.test(message ?? '');
++}
++
++/** 写请求只在连接阶段失败时重试（最多 2 次）；请求已发出后的错误不重试，避免重复评论 */
++async function retryOnConnectFailure<T>(fn: () => Promise<T>): Promise<T> {
++  for (let attempt = 0; ; attempt++) {
++    try {
++      return await fn();
++    } catch (error) {
++      if (!isConnectFailure(error) || attempt >= 2) throw error;
++      await new Promise((resolve) => setTimeout(resolve, 1500 * (attempt + 1)));
++    }
++  }
++}
++
++/** 服务器明确拒绝（4xx）：pingCodeClient 把响应转成了带状态码的错误文案 */
++function isRejectedByServer(error: unknown): boolean {
++  const message = error instanceof Error ? error.message : String(error);
++  return /^(Forbidden|Not Found|PingCode API Error (4dd))/.test(message);
++}
++
++async function postComment(workItemId: string, content: string, author?: Author): Promise<{ id?: string; note: string }> {
++  const body: Record<string, unknown> = { principal_type: 'workitem', principal_id: workItemId, content };
++  if (author) body.created_by = author.id;
++  try {
++    const created = await retryOnConnectFailure(() => pingCodeClient.post<{ id?: string }>('/v1/comments', body));
++    return { id: created?.id, note: author ? `已评论（署名 ${author.name}）` : '已评论' };
++  } catch (error) {
++    // 只有服务器明确拒绝时才当作不支持指定 created_by：去掉后重试（被拒的那次没有创建数据），正文前加署名。
++    // 网络错误直接抛出，不能走这里，否则会把署名误降级成应用名
++    if (!author || !isRejectedByServer(error)) throw error;
++    logWarn('带 created_by 发评论被拒，改为正文署名', { error: String(error) });
++    const created = await retryOnConnectFailure(() => pingCodeClient.post<{ id?: string }>('/v1/comments', {
++      principal_type: 'workitem',
++      principal_id: workItemId,
++      content: `【${author.name}】${content}`,
++    }));
++    return { id: created?.id, note: `已评论（接口不支持代署名，正文前加了【${author.name}】）` };
++  }
++}
++
++/** 上传到评论下，作为评论附件（与在网页上给评论贴截图一致） */
++async function uploadCommentFile(workItemId: string, commentId: string, filePath: string, title: string): Promise<void> {
++  const form = new FormData();
++  form.append('file', new Blob([new Uint8Array(readFileSync(filePath))]), title);
++  form.append('title', title);
++  await retryOnConnectFailure(() =>
++    pingCodeClient.post(`/v1/attachments?principal_type=workitem&principal_id=${workItemId}&comment_id=${commentId}`, form),
++  );
++}
++
++interface NamedFile {
++  path: string;
++  title: string;
++}
++
++async function postCommentWithFiles(item: WorkItem, content: string, files: NamedFile[], author?: Author): Promise<string> {
++  const comment = await postComment(item.id, content, author);
++  if (!files.length) return comment.note;
++  if (!comment.id) return `${comment.note}；接口未返回评论 ID，${files.length} 个附件未上传`;
++  const failed: string[] = [];
++  for (const file of files) {
++    try {
++      await uploadCommentFile(item.id, comment.id, file.path, file.title);
++    } catch (error) {
++      failed.push(`${file.title}（${error instanceof Error ? error.message : String(error)}）`);
++    }
++  }
++  const uploaded = files.length - failed.length;
++  return `${comment.note}；附件上传 ${uploaded}/${files.length}${failed.length ? `，失败：${failed.join('；')}` : ''}`;
++}
++
++interface UpdatePlan {
++  body: Record<string, unknown>;
++  changes: string[];
++}
++
++/**
++ * @param optionalFields 这些字段不存在或没有对应选项时静默跳过（用于默认值）
++ */
++async function planUpdate(
++  item: WorkItem,
++  state: string | undefined,
++  fields: Record<string, unknown> | undefined,
++  optionalFields: Set<string> = new Set(),
++): Promise<UpdatePlan> {
++  const body: Record<string, unknown> = {};
++  const changes: string[] = [];
++
++  if (state && state.trim()) {
++    const states = await getStates(item.project.id, item.type);
++    const target = states.find((s) => s.id === state || s.name === state.trim());
++    if (!target) {
++      throw new Error(`状态「${state}」不存在，${item.identifier} 可用状态：${states.map((s) => s.name).join('、')}`);
++    }
++    if (item.state?.id !== target.id) {
++      body.state_id = target.id;
++      changes.push(`状态：${item.state?.name ?? '-'} → ${target.name}`);
++    } else {
++      changes.push(`状态：已是「${target.name}」，不改动`);
++    }
++  }
++
++  if (fields && Object.keys(fields).length) {
++    const defs = await getPropertyDefs(item.project.id, item.type);
++    const properties: Record<string, unknown> = {};
++    for (const [key, value] of Object.entries(fields)) {
++      const def = defs.find((d) => d.id === key || d.name === key);
++      if (!def) {
++        if (optionalFields.has(key)) continue;
++        throw new Error(`字段「${key}」不存在，可用字段：${defs.map((d) => d.name).join('、')}`);
++      }
++      let mapped: unknown = value;
++      if (def.options?.length && typeof value === 'string') {
++        const option = def.options.find((o) => o._id === value || o.text === value);
++        if (!option) {
++          if (optionalFields.has(key)) continue;
++          throw new Error(`字段「${def.name}」没有选项「${value}」，可选：${def.options.map((o) => o.text).join('、')}`);
++        }
++        mapped = option._id;
++      }
++      properties[def.id] = mapped;
++      changes.push(`${def.name}：${String(value)}`);
++    }
++    if (Object.keys(properties).length) body.properties = properties;
++  }
++
++  return { body, changes };
++}
++
++function previewFooter(): string {
++  return '\n\n以上为预览，尚未写入 PingCode。请把预览给用户确认；确认后用相同参数加 confirm=true 再调用一次。';
++}
++
++export interface AddCommentParams {
++  work_item: string;
++  content: string;
++  files?: string[];
++  as_user?: string;
++  confirm?: boolean;
++}
++
++export async function addWorkItemComment(params: AddCommentParams): Promise<BugfixToolResult> {
++  const files = (params.files ?? []).map((path) => ({ path: expandHome(path), title: basename(path) }));
++  checkFiles(files.map((f) => f.path));
++  const item = await getWorkItem(await resolveWorkItemId(params.work_item));
++  const author = await resolveAuthor(params.as_user);
++
++  if (!params.confirm) {
++    const lines = [
++      `将给 ${item.identifier} ${item.title} 追加评论（署名：${author?.name ?? '应用'}）：`,
++      '',
++      params.content,
++      ...(files.length ? ['', `评论附件：${files.map((f) => f.title).join('、')}`] : []),
++    ];
++    return { content: [{ type: 'text', text: lines.join('\n') + previewFooter() }] };
++  }
++
++  const result = await postCommentWithFiles(item, params.content, files, author);
++  return { content: [{ type: 'text', text: `${item.identifier}：${result}\n${item.html_url}` }] };
++}
++
++export interface TransitionParams {
++  work_item: string;
++  state: string;
++  fields?: Record<string, unknown>;
++  comment?: string;
++  as_user?: string;
++  confirm?: boolean;
++}
++
++export async function transitionWorkItem(params: TransitionParams): Promise<BugfixToolResult> {
++  const item = await getWorkItem(await resolveWorkItemId(params.work_item));
++  const plan = await planUpdate(item, params.state, params.fields);
++  const author = params.comment ? await resolveAuthor(params.as_user) : undefined;
++
++  if (!params.confirm) {
++    const lines = [`将修改 ${item.identifier} ${item.title}：`, '', ...plan.changes.map((c) => `- ${c}`)];
++    if (params.comment) lines.push('', `并追加评论（署名：${author?.name ?? '应用'}）：`, '', params.comment);
++    return { content: [{ type: 'text', text: lines.join('\n') + previewFooter() }] };
++  }
++
++  if (Object.keys(plan.body).length) await pingCodeClient.patch(`/v1/pjm/work_items/${item.id}`, plan.body);
++  const commentResult = params.comment ? await postCommentWithFiles(item, params.comment, [], author) : '';
++  const summary = [plan.changes.join('；'), commentResult].filter(Boolean).join('；');
++  return { content: [{ type: 'text', text: `${item.identifier}：${summary}\n${item.html_url}` }] };
++}
++
++export interface SubmitFixParams {
++  work_item: string;
++  cause: string;
++  changes: string[] | string;
++  before: string;
++  after: string;
++  verification?: string;
++  commit?: string;
++  before_images?: string[];
++  after_images?: string[];
++  state?: string;
++  fields?: Record<string, unknown>;
++  as_user?: string;
++  confirm?: boolean;
++}
++
++function namedImages(paths: string[] | undefined, prefix: string): NamedFile[] {
++  const list = paths ?? [];
++  return list.map((path, index) => {
++    const ext = extname(path) || '.png';
++    return { path: expandHome(path), title: list.length > 1 ? `${prefix}-${index + 1}${ext}` : `${prefix}${ext}` };
++  });
++}
++
++/** 修复说明固定成分段格式：即使网页把换行折叠，【】分段仍然可读 */
++export function composeFixComment(params: SubmitFixParams, files: NamedFile[]): string {
++  const changes = (Array.isArray(params.changes) ? params.changes : String(params.changes).split('\n'))
++    .map((c) => String(c).trim().replace(/^(\d+[.、)]|[-*•])\s*/, ''))
++    .filter(Boolean);
++  const lines = [
++    '【修复说明】',
++    `【问题原因】${params.cause.trim()}`,
++    '【修改内容】',
++    ...changes.map((c, i) => `${i + 1}. ${c}`),
++    `【修改前】${params.before.trim()}`,
++    `【修改后】${params.after.trim()}`,
++  ];
++  if (params.verification?.trim()) lines.push(`【验证】${params.verification.trim()}`);
++  if (params.commit?.trim()) lines.push(`【提交】${params.commit.trim()}`);
++  if (files.length) lines.push(`【截图】见本条评论附件：${files.map((f) => f.title).join('、')}`);
++  return lines.join('\n');
++}
++
++export async function submitFix(params: SubmitFixParams): Promise<BugfixToolResult> {
++  const files = [...namedImages(params.before_images, '修改前'), ...namedImages(params.after_images, '修改后')];
++  checkFiles(files.map((f) => f.path));
++  const item = await getWorkItem(await resolveWorkItemId(params.work_item));
++  const state = params.state ?? '已修复';
++  // 缺陷默认把「解决方案」设为「已修复」；项目没有这个字段或选项时跳过
++  const defaultFields: Record<string, unknown> = item.type === 'bug' ? { 解决方案: '已修复' } : {};
++  const fields = { ...defaultFields, ...(params.fields ?? {}) };
++  const optional = new Set(Object.keys(defaultFields).filter((k) => !(params.fields && k in params.fields)));
++  const plan = await planUpdate(item, state, fields, optional);
++  const author = await resolveAuthor(params.as_user);
++  const content = composeFixComment(params, files);
++
++  if (!params.confirm) {
++    const lines = [
++      `将提交 ${item.identifier} ${item.title} 的修复：`,
++      '',
++      ...plan.changes.map((c) => `- ${c}`),
++      `- 评论署名：${author?.name ?? '应用'}`,
++      ...(files.length ? [`- 评论附件：${files.map((f) => `${f.title} ← ${f.path}`).join('；')}`] : []),
++      '',
++      '评论内容：',
++      '',
++      content,
++    ];
++    return { content: [{ type: 'text', text: lines.join('\n') + previewFooter() }] };
++  }
++
++  // 先发评论再改状态：评论失败时状态保持不变，便于重试
++  const commentResult = await postCommentWithFiles(item, content, files, author);
++  if (Object.keys(plan.body).length) await pingCodeClient.patch(`/v1/pjm/work_items/${item.id}`, plan.body);
++  const summary = [commentResult, ...plan.changes].join('；');
++  return { content: [{ type: 'text', text: `${item.identifier}：${summary}\n${item.html_url}` }] };
++}
++
++// ---------------------------------------------------------------------------
++// 工具注册
++
++const WRITE_NOTE =
++  '【写操作】不带 confirm=true 时只返回预览；必须先把预览给用户看并得到明确同意，再用相同参数加 confirm=true 调用。';
++
++export const BUGFIX_TOOLS: Tool[] = [
++  {
++    name: 'pingcode__list_my_work_items',
++    description:
++      '列出指派给我（或指定负责人）的工作项，默认只看未完成的缺陷，按优先级排序，带每条的截图数量。' +
++      '「我」取自 ~/.pingcode-mcp/settings.json 的 me，项目默认取 default_project。改 bug 前先用它拿清单。',
++    annotations: { readOnlyHint: true },
++    inputSchema: {
++      type: 'object',
++      properties: {
++        assignee: { type: 'string', description: '负责人姓名 / 用户名 / 邮箱 / 用户 ID；不传则用 settings.json 的 me' },
++        project: { type: 'string', description: '项目编号（如 PROJ）、名称或 ID；传 all 查全部项目；不传则用 default_project' },
++        type: { type: 'string', description: '工作项类型：bug（默认）、story、task、epic、feature、issue，或 all' },
++        include_done: { type: 'boolean', description: '是否包含已完成 / 已关闭，默认 false' },
++        keywords: { type: 'string', description: '按标题关键词过滤' },
++      },
++    },
++  },
++  {
++    name: 'pingcode__view_work_item',
++    description:
++      '查看一个工作项的完整详情，用于理解 bug / 需求：标题、状态、优先级、严重程度、描述、重现步骤、自定义字段、附件、评论（含评论附件），' +
++      '并把描述 / 评论 / 附件里的截图下载为原图直接返回（[图N] 与正文占位对应），同时保存到 ~/.pingcode-mcp/cache/<编号>/。' +
++      '支持编号（PROJ-21）、网页链接或内部 ID。看 bug 请优先用它，不要用 pingcode__get_work_item。',
++    annotations: { readOnlyHint: true },
++    inputSchema: {
++      type: 'object',
++      properties: {
++        work_item: { type: 'string', description: '工作项编号（如 PROJ-21）、PingCode 网页链接或内部 ID' },
++        include_images: { type: 'boolean', description: '是否下载并返回截图原图，默认 true' },
++        max_images: { type: 'integer', description: '最多内联返回几张图，其余只落盘，默认 10' },
++        include_comments: { type: 'boolean', description: '是否读取评论，默认 true' },
++        download_files: { type: 'boolean', description: '是否把非图片附件（日志、Excel 等）下载到本地缓存目录，默认 false' },
++      },
++      required: ['work_item'],
++    },
++  },
++  {
++    name: 'pingcode__submit_fix',
++    description:
++      WRITE_NOTE +
++      '改完一个 bug 后回写 PingCode：按固定格式发一条修复评论（问题原因、修改内容、修改前、修改后、验证、提交号），' +
++      '把修改前 / 修改后截图作为评论附件上传，再把状态改为「已修复」（缺陷同时把「解决方案」设为「已修复」）。' +
++      '修改前 / 修改后要写成测试能直接对照的现象描述，界面问题尽量附截图。',
++    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
++    inputSchema: {
++      type: 'object',
++      properties: {
++        work_item: { type: 'string', description: '工作项编号（如 PROJ-21）、网页链接或内部 ID' },
++        cause: { type: 'string', description: '问题原因：根因是什么，为什么会出现' },
++        changes: { type: 'array', description: '修改内容，每条写「文件或模块：改了什么」' },
++        before: { type: 'string', description: '修改前的现象（与 bug 描述对应）' },
++        after: { type: 'string', description: '修改后的现象 / 行为' },
++        verification: { type: 'string', description: '验证方式与结果，如 npm run validate 通过、本地 H5 按重现步骤验证通过' },
++        commit: { type: 'string', description: '提交号、分支、是否已部署 UAT' },
++        before_images: { type: 'array', description: '修改前截图的本地路径，支持 ~/ 开头（可用 view_work_item 缓存的原 bug 截图或本地复现截图）' },
++        after_images: { type: 'array', description: '修改后截图的本地路径，支持 ~/ 开头' },
++        state: { type: 'string', description: '目标状态，默认「已修复」；传空字符串则不改状态' },
++        fields: { type: 'object', description: '额外要改的字段，键为字段中文名，下拉字段值写选项文字，如 {"原因分析": "修改引入"}' },
++        as_user: { type: 'string', description: '评论署名人，默认 settings.json 的 me' },
++        confirm: { type: 'boolean', description: '用户确认预览后传 true 才真正写入' },
++      },
++      required: ['work_item', 'cause', 'changes', 'before', 'after'],
++    },
++  },
++  {
++    name: 'pingcode__transition_work_item',
++    description:
++      WRITE_NOTE +
++      '按状态名修改工作项状态（如 打开 / 进行中 / 已修复 / 关闭），可同时按中文名设置字段（如 {"解决方案": "已修复"}），可附一条评论。' +
++      '状态名不对时返回可用状态列表。提交修复请优先用 pingcode__submit_fix。',
++    annotations: { readOnlyHint: false, destructiveHint: false },
++    inputSchema: {
++      type: 'object',
++      properties: {
++        work_item: { type: 'string', description: '工作项编号（如 PROJ-21）、网页链接或内部 ID' },
++        state: { type: 'string', description: '目标状态名（如 进行中）或状态 ID' },
++        fields: { type: 'object', description: '要同时修改的字段，键为字段中文名或 ID，下拉字段的值写选项文字' },
++        comment: { type: 'string', description: '同时追加的评论（纯文本）' },
++        as_user: { type: 'string', description: '评论署名人，默认 settings.json 的 me' },
++        confirm: { type: 'boolean', description: '用户确认预览后传 true 才真正写入' },
++      },
++      required: ['work_item', 'state'],
++    },
++  },
++  {
++    name: 'pingcode__add_work_item_comment',
++    description:
++      WRITE_NOTE +
++      '给工作项追加一条评论（纯文本），可把本地文件（如截图）作为评论附件上传，默认以 settings.json 的 me 署名。',
++    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
++    inputSchema: {
++      type: 'object',
++      properties: {
++        work_item: { type: 'string', description: '工作项编号（如 PROJ-21）、网页链接或内部 ID' },
++        content: { type: 'string', description: '评论内容（纯文本）' },
++        files: { type: 'array', description: '作为评论附件上传的本地文件路径，支持 ~/ 开头' },
++        as_user: { type: 'string', description: '署名人，默认 settings.json 的 me' },
++        confirm: { type: 'boolean', description: '用户确认预览后传 true 才真正写入' },
++      },
++      required: ['work_item', 'content'],
++    },
++  },
++];
++
++/** 不是本模块的工具时返回 undefined，交给上游 switch 处理 */
++export async function handleBugfixTool(
++  name: string,
++  args: Record<string, unknown> | undefined,
++): Promise<BugfixToolResult | undefined> {
++  const a = args ?? {};
++  switch (name) {
++    case 'pingcode__list_my_work_items':
++      return listMyWorkItems(a as unknown as ListMyWorkItemsParams);
++    case 'pingcode__view_work_item':
++      return viewWorkItem(a as unknown as ViewWorkItemParams);
++    case 'pingcode__submit_fix':
++      return submitFix(a as unknown as SubmitFixParams);
++    case 'pingcode__transition_work_item':
++      return transitionWorkItem(a as unknown as TransitionParams);
++    case 'pingcode__add_work_item_comment':
++      return addWorkItemComment(a as unknown as AddCommentParams);
++    default:
++      return undefined;
++  }
++}
+diff --git a/src/tools/product.ts b/src/tools/product.ts
+index 79d4df1..a1bc627 100644
+--- a/src/tools/product.ts
++++ b/src/tools/product.ts
+@@ -9,10 +9,12 @@ export interface AddProductMembersParams {
+ export async function addProductMembers(params: AddProductMembersParams) {
+   const results: unknown[] = [];
+   for (const uid of params.user_ids) {
+-    const body: { user_id: string; role_id?: string } = { user_id: uid };
++    const body: { member: { id: string; type: string }; role_id?: string } = {
++      member: { id: uid, type: 'user' },
++    };
+     if (params.role_id) body.role_id = params.role_id;
+     const result = await pingCodeClient.post(
+-      `/v1/products/${params.product_id}/members`,
++      `/v1/ship/products/${params.product_id}/members`,
+       body,
+     );
+     results.push(result);
+diff --git a/src/tools/project.ts b/src/tools/project.ts
+index a004827..3edda5d 100644
+--- a/src/tools/project.ts
++++ b/src/tools/project.ts
+@@ -50,7 +50,9 @@ export interface AddProjectMembersParams {
+ export async function addProjectMembers(params: AddProjectMembersParams) {
+   const results: unknown[] = [];
+   for (const uid of params.user_ids) {
+-    const body: { user_id: string; role_id?: string } = { user_id: uid };
++    const body: { member: { id: string; type: string }; role_id?: string } = {
++      member: { id: uid, type: 'user' },
++    };
+     if (params.role_id) body.role_id = params.role_id;
+     const result = await pingCodeClient.post(
+       `/v1/project/projects/${params.project_id}/members`,
+diff --git a/src/tools/sprint.ts b/src/tools/sprint.ts
+index 73722e6..0a6b1df 100644
+--- a/src/tools/sprint.ts
++++ b/src/tools/sprint.ts
+@@ -14,9 +14,17 @@ export async function listSprints(params: ListSprintsParams = {}) {
+   query.append('page_size', String(params.page_size ?? 30));
+ 
+   const queryString = query.toString() ? `?${query.toString()}` : '';
++
++  if (params.project_id) {
++    return pingCodeClient.get(`/v1/project/projects/${params.project_id}/sprints${queryString}`);
++  }
++
+   return pingCodeClient.get(`/v1/project/sprints${queryString}`);
+ }
+ 
+-export async function getSprint(sprintId: string) {
++export async function getSprint(sprintId: string, projectId?: string) {
++  if (projectId) {
++    return pingCodeClient.get(`/v1/project/projects/${projectId}/sprints/${sprintId}`);
++  }
+   return pingCodeClient.get(`/v1/project/sprints/${sprintId}`);
+ }
+diff --git a/src/tools/testhub.ts b/src/tools/testhub.ts
+index e11fac9..2dcc9f5 100644
+--- a/src/tools/testhub.ts
++++ b/src/tools/testhub.ts
+@@ -9,7 +9,9 @@ export interface AddTestLibraryMembersParams {
+ export async function addTestLibraryMembers(params: AddTestLibraryMembersParams) {
+   const results: unknown[] = [];
+   for (const uid of params.user_ids) {
+-    const body: { user_id: string; role_id?: string } = { user_id: uid };
++    const body: { member: { id: string; type: string }; role_id?: string } = {
++      member: { id: uid, type: 'user' },
++    };
+     if (params.role_id) body.role_id = params.role_id;
+     const result = await pingCodeClient.post(
+       `/v1/testhub/libraries/${params.library_id}/members`,
+diff --git a/src/tools/wiki.ts b/src/tools/wiki.ts
+index 317db93..9ae5400 100644
+--- a/src/tools/wiki.ts
++++ b/src/tools/wiki.ts
+@@ -63,7 +63,9 @@ export interface AddWikiMembersParams {
+ export async function addWikiMembers(params: AddWikiMembersParams) {
+   const results: unknown[] = [];
+   for (const uid of params.user_ids) {
+-    const body: { user_id: string; role_id?: string } = { user_id: uid };
++    const body: { member: { id: string; type: string }; role_id?: string } = {
++      member: { id: uid, type: 'user' },
++    };
+     if (params.role_id) body.role_id = params.role_id;
+     const result = await pingCodeClient.post(
+       `/v1/wiki/spaces/${params.space_id}/members`,
+diff --git a/src/tools/work-item.ts b/src/tools/work-item.ts
+index 168f67a..e15541f 100644
+--- a/src/tools/work-item.ts
++++ b/src/tools/work-item.ts
+@@ -8,6 +8,7 @@ export interface ListWorkItemsParams {
+   state_ids?: string;
+   sprint_ids?: string;
+   keywords?: string;
++  updated_between?: string;
+   page_index?: number;
+   page_size?: number;
+ }
+@@ -57,6 +58,7 @@ export async function listWorkItems(params: ListWorkItemsParams = {}) {
+   if (params.state_ids) query.append('state_ids', params.state_ids);
+   if (params.sprint_ids) query.append('sprint_ids', params.sprint_ids);
+   if (params.keywords) query.append('keywords', params.keywords);
++  if (params.updated_between) query.append('updated_between', params.updated_between);
+   query.append('page_index', String(params.page_index ?? 0));
+   query.append('page_size', String(params.page_size ?? 30));
+ 
+diff --git a/src/utils/html-to-markdown.ts b/src/utils/html-to-markdown.ts
+new file mode 100644
+index 0000000..84ac595
+--- /dev/null
++++ b/src/utils/html-to-markdown.ts
+@@ -0,0 +1,90 @@
++/**
++ * PingCode 富文本（描述、多行文本属性、评论）转 Markdown。
++ * 只处理 PingCode 编辑器常见标签；图片替换为 [图N] 占位，并按出现顺序收集地址，
++ * 便于调用方下载原图后与占位一一对应。
++ */
++
++export interface HtmlImage {
++  /** 从 1 开始的全局序号，对应正文里的 [图N] */
++  index: number;
++  src: string;
++  alt: string;
++  /** PingCode 在 img 上标注的原图字节数 */
++  size?: number;
++}
++
++const ENTITIES: Record<string, string> = {
++  amp: '&',
++  lt: '<',
++  gt: '>',
++  quot: '"',
++  apos: "'",
++  nbsp: ' ',
++};
++
++function decodeEntities(text: string): string {
++  return text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (match, code: string) => {
++    if (code[0] === '#') {
++      const value = code[1] === 'x' || code[1] === 'X' ? parseInt(code.slice(2), 16) : parseInt(code.slice(1), 10);
++      return Number.isFinite(value) ? String.fromCodePoint(value) : match;
++    }
++    return ENTITIES[code.toLowerCase()] ?? match;
++  });
++}
++
++function getAttr(tag: string, name: string): string | undefined {
++  const match = tag.match(new RegExp(`\\s${name}\\s*=\\s*("([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i'));
++  if (!match) return undefined;
++  return decodeEntities(match[2] ?? match[3] ?? match[4] ?? '');
++}
++
++/**
++ * @param html PingCode 返回的 HTML；纯文本也可以直接传入
++ * @param images 收集图片的数组，多段 HTML 共用同一个数组即可得到全局连续的 [图N]
++ */
++export function htmlToMarkdown(html: string | null | undefined, images: HtmlImage[] = []): string {
++  if (!html) return '';
++  if (!/<[a-z][\s\S]*>/i.test(html)) return decodeEntities(html).trim();
++
++  let text = html.replace(/\r\n?/g, '\n');
++
++  text = text.replace(/<img\b[^>]*>/gi, (tag) => {
++    const src = getAttr(tag, 'src');
++    if (!src) return '';
++    const sizeAttr = Number(getAttr(tag, 'size'));
++    const image: HtmlImage = {
++      index: images.length + 1,
++      src,
++      alt: getAttr(tag, 'alt') ?? '',
++      size: Number.isFinite(sizeAttr) && sizeAttr > 0 ? sizeAttr : undefined,
++    };
++    images.push(image);
++    return `\n[图${image.index}]\n`;
++  });
++
++  text = text
++    .replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, '')
++    .replace(/<br\s*\/?>/gi, '\n')
++    .replace(/<h([1-6])\b[^>]*>/gi, (_m, level: string) => `\n\n${'#'.repeat(Number(level))} `)
++    .replace(/<\/h[1-6]>/gi, '\n\n')
++    .replace(/<li\b[^>]*>/gi, '\n- ')
++    .replace(/<\/(ul|ol)>/gi, '\n')
++    .replace(/<(strong|b)\b[^>]*>([\s\S]*?)<\/\1>/gi, '**$2**')
++    .replace(/<(em|i)\b[^>]*>([\s\S]*?)<\/\1>/gi, '*$2*')
++    .replace(/<code\b[^>]*>([\s\S]*?)<\/code>/gi, '`$1`')
++    .replace(/<a\b[^>]*href\s*=\s*"([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, (_m, href: string, label: string) => {
++      const plain = label.replace(/<[^>]+>/g, '').trim();
++      return plain && plain !== href ? `[${plain}](${href})` : href;
++    })
++    .replace(/<\/(td|th)>/gi, ' | ')
++    .replace(/<\/tr>/gi, '\n')
++    .replace(/<\/(p|div|blockquote|pre|table)>/gi, '\n\n')
++    .replace(/<[^>]+>/g, '');
++
++  return decodeEntities(text)
++    .split('\n')
++    .map((line) => line.replace(/[ \t]+$/g, ''))
++    .join('\n')
++    .replace(/\n{3,}/g, '\n\n')
++    .trim();
++}
+diff --git a/src/utils/http.ts b/src/utils/http.ts
+index 9ef1c65..0c5986b 100644
+--- a/src/utils/http.ts
++++ b/src/utils/http.ts
+@@ -2,8 +2,9 @@ import axios from 'axios';
+ import https from 'https';
+ import { logDebug, logWarn } from './logger.js';
+ 
++// 默认校验证书；私有部署用自签证书时设置 PINGCODE_TLS_INSECURE=1
+ const httpsAgent = new https.Agent({
+-  rejectUnauthorized: false,
++  rejectUnauthorized: process.env.PINGCODE_TLS_INSECURE !== '1',
+ });
+ 
+ export function createAxiosInstance() {
